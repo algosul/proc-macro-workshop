@@ -12,8 +12,32 @@ proc-macro = true
 name = "tests"
 path = "tests/progress.rs"
 
+[[test]]
+name = "01"
+path = "tests/01-parse.rs"
+
+[[test]]
+name = "02"
+path = "tests/02-create-builder.rs"
+
+[[test]]
+name = "03"
+path = "tests/03-call-setters.rs"
+
+[[test]]
+name = "04"
+path = "tests/04-call-build.rs"
+
+[[test]]
+name = "05"
+path = "tests/05-method-chaining.rs"
+
 [dev-dependencies]
 trybuild = { version = "1.0.108", features = ["diff"] }
 
 [dependencies]
-# TODO
+syn = { version = "*", features = ["full"] }
+quote = "*"
+proc-macro2 = "*"
+algosul-derive-util = { path = "../../algosul-rs/derive-util" }
+frunk = "0.5.0"
