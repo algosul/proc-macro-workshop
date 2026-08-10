@@ -1,3 +1,8 @@
 Cargo.lock
 target/
 wip/
+
+# IDE Directory
+.idea/
+.vs/
+.vscode/
