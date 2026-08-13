@@ -1,12 +1,8 @@
 use std::ops::Not;
 
 use proc_macro2::{Ident, Span, TokenStream};
-use quote::{format_ident, quote_spanned, IdentFragment, ToTokens};
+use quote::{IdentFragment, ToTokens, format_ident, quote_spanned};
 use syn::{
-  ext::IdentExt,
-  parse_macro_input,
-  parse_quote,
-  spanned::Spanned,
   Attribute,
   Data,
   DataStruct,
@@ -20,6 +16,10 @@ use syn::{
   PathArguments,
   Type,
   Visibility,
+  ext::IdentExt,
+  parse_macro_input,
+  parse_quote,
+  spanned::Spanned,
 };
 
 #[derive(Clone)]
@@ -46,6 +46,17 @@ enum StructFieldNameParsed
 {
   Named(Ident),
   Unnamed(usize),
+}
+
+#[derive(Default, Debug, Clone)]
+struct StructFieldTokens
+{
+  errors: Vec<Error>,
+  new:    TokenStream,
+  init:   TokenStream,
+  setter: Option<TokenStream>,
+  getter: Option<TokenStream>,
+  build:  TokenStream,
 }
 
 impl StructFieldNameParsed
@@ -91,7 +102,41 @@ impl ToTokens for StructFieldNameParsed
   }
 }
 
-#[proc_macro_derive(Builder)]
+impl FromIterator<StructFieldTokens> for StructFieldTokens
+{
+  fn from_iter<T: IntoIterator<Item = StructFieldTokens>>(iter: T) -> Self
+  {
+    iter.into_iter().fold(StructFieldTokens::default(), |mut acc, item| {
+      acc.errors.extend(item.errors);
+      acc.new.extend(item.new);
+      acc.init.extend(item.init);
+      match (&mut acc.setter, item.setter)
+      {
+        (Some(a), Some(b)) =>
+        {
+          a.extend(b);
+        }
+        (None, Some(a)) => acc.setter = Some(a),
+        (_, None) =>
+        {}
+      }
+      match (&mut acc.getter, item.getter)
+      {
+        (Some(a), Some(b)) =>
+        {
+          a.extend(b);
+        }
+        (None, Some(a)) => acc.getter = Some(a),
+        (_, None) =>
+        {}
+      }
+      acc.build.extend(item.build);
+      acc
+    })
+  }
+}
+
+#[proc_macro_derive(Builder, attributes(builder))]
 pub fn derive(input: proc_macro::TokenStream) -> proc_macro::TokenStream
 {
   let input = parse_macro_input!(input as DeriveInput);
@@ -108,25 +153,12 @@ fn get_inner_type_if(ty: &Type, f: impl FnOnce(&Ident) -> bool)
 -> Option<Type>
 {
   if let Type::Path(path) = ty
+    && let Some(last) = path.path.segments.last()
+    && f(&last.ident)
+    && let PathArguments::AngleBracketed(args) = &last.arguments
+    && let GenericArgument::Type(inner_ty) = args.args.first()?
   {
-    path.path.segments.last().and_then(|last| {
-      f(&last.ident).then(|| None::<Type>)?;
-      if let PathArguments::AngleBracketed(args) = &last.arguments
-      {
-        if let Some(GenericArgument::Type(inner_ty)) = args.args.first()
-        {
-          Some(inner_ty.clone())
-        }
-        else
-        {
-          None
-        }
-      }
-      else
-      {
-        None
-      }
-    })
+    Some(inner_ty.clone())
   }
   else
   {
@@ -150,39 +182,35 @@ fn parse_struct(
 {
   let mut errors = Vec::new();
   let mut no_default = false;
-  let struct_attr: Result<(), Vec<_>> = struct_attrs
+
+  // parse struct attrs
+  let struct_attr_errors: Vec<_> = struct_attrs
     .iter()
     .filter(|attr| attr.meta.path().is_ident("builder"))
     .map(|attr| {
-      attr
-        .parse_args::<Ident>()
-        .map(|ident| {
-          if ident.unraw() == "no_default"
-          {
-            if no_default
-            {
-              return Err(Error::new_spanned(
-                ident,
-                "already set 'no_default'",
-              ));
-            }
-            no_default = true;
-          }
-          Ok(())
-        })
-        .and_then(|inner| inner)
+      let ident = attr.parse_args::<Ident>()?;
+      if ident.unraw() == "no_default"
+      {
+        if no_default
+        {
+          return Err(Error::new_spanned(ident, "already set 'no_default'"));
+        }
+        no_default = true;
+      }
+      Ok(())
     })
-    .fold(Ok(()), |acc, result| match (acc, result)
+    .fold(Vec::new(), |acc, result| match (acc, result)
     {
-      (Ok(()), Ok(())) => Ok(()),
-      (Ok(()), Err(e)) => Err(vec![e]),
-      (Err(errs), Ok(())) => Err(errs),
-      (Err(mut errs), Err(e)) =>
+      (errs, Ok(())) => errs,
+      (mut errs, Err(e)) =>
       {
         errs.push(e);
-        Err(errs)
+        errs
       }
     });
+  errors.extend(struct_attr_errors);
+
+  // parse fields
   let fields = data_struct
     .fields
     .iter()
@@ -196,28 +224,54 @@ fn parse_struct(
         .unwrap_or(StructFieldNameParsed::Unnamed(i));
       let span = field.span();
       let ty = field.ty.clone();
-      let skip_set = false;
-      let skip_get = false;
+      let mut skip_set = false;
+      let mut skip_get = false;
       let mut skip = false;
       let mut each = None;
-      for attr in field.attrs.iter()
+
+      for attr in
+        field.attrs.iter().filter(|attr| attr.meta.path().is_ident("builder"))
       {
-        if !attr.meta.path().is_ident("builder")
-        {
-          continue;
-        }
         match attr.parse_args::<Ident>()
         {
           Ok(arg) =>
           {
-            let arg = arg.unraw();
-            if arg == "skip"
+            let arg = arg.to_string();
+            match arg.as_str()
             {
-              if skip
+              "skip" =>
               {
-                errors.push(Error::new_spanned(arg, "already set 'skip'"));
+                if skip
+                {
+                  errors.push(Error::new_spanned(arg, "already set 'skip'"));
+                }
+                skip = true;
               }
-              skip = true;
+              "skip_set" =>
+              {
+                if skip_set
+                {
+                  errors
+                    .push(Error::new_spanned(arg, "already set 'skip_set'"));
+                }
+                skip_set = true;
+              }
+              "skip_get" =>
+              {
+                if skip_get
+                {
+                  errors
+                    .push(Error::new_spanned(arg, "already set 'skip_get'"));
+                }
+                skip_get = true;
+              }
+              other =>
+              {
+                errors.push(Error::new_spanned(
+                  arg,
+                  format!("unknown attribute '{other}'"),
+                ));
+              }
             }
           }
           Err(err) =>
@@ -227,17 +281,16 @@ fn parse_struct(
         };
         match attr.parse_args::<ExprAssign>()
         {
-          Ok(expr) =>
+          Ok(ExprAssign { left, right, .. }) =>
           {
-            todo!();
             if let Some(each) = each
             {
               errors.push(Error::new_spanned(
-                expr,
-                format!("already set 'each = {each}'"),
+                attr,
+                format!("already set 'each = '"),
               ));
             }
-            each = Some(todo!());
+            each = Some(());
           }
           Err(err) =>
           {
@@ -257,7 +310,93 @@ fn parse_struct(
       }
     })
     .collect();
-  StructParsed { errors: Vec::new(), fields, no_default }
+  StructParsed { errors, fields, no_default }
+}
+
+fn generate_field_tokens(
+  vis: &Visibility, field: &StructFieldParsed,
+) -> StructFieldTokens
+{
+  let mut errors = Vec::new();
+  let unknown_ident =
+    field.name_or_index.to_ident(Ident::new("unknown", Span::call_site()));
+  let span = field.span;
+  let name = field.name.as_ref().unwrap_or_else(|| {
+    errors.push(Error::new(
+      span.clone(),
+      "not set ident, please use #[builder(ident = \"new_ident\")]",
+    ));
+    &unknown_ident
+  });
+  let old_field_ty = &field.ty;
+  let field_ty_ref: Type;
+  let field_ty_mut: Type;
+  let option_inner_ty: Type;
+  let inner_ty: Type;
+  let param_ty: &Type;
+  let is_option: bool;
+  match get_option_inner_type(&old_field_ty)
+  {
+    Some(old_field_inner_ty) =>
+    {
+      is_option = true;
+      inner_ty = old_field_inner_ty;
+    }
+    None =>
+    {
+      is_option = false;
+      inner_ty = old_field_ty.clone();
+    }
+  }
+  field_ty_ref = parse_quote!(::core::option::Option<&#inner_ty>);
+  field_ty_mut = parse_quote!(::core::option::Option<&mut #inner_ty>);
+  option_inner_ty = parse_quote!(::core::option::Option<#inner_ty>);
+  param_ty = &inner_ty;
+
+  let new = quote_spanned! {span=>
+    #name: #option_inner_ty,
+  };
+
+  let init = quote_spanned! {span=>
+    #name: ::core::option::None,
+  };
+
+  let setter = field.skip_set.not().then(|| {
+    let fn_name = name;
+    quote_spanned! {span=>
+      #vis fn #fn_name(&mut self, #name: #param_ty) -> &mut Self {
+        self.#name = Some(#name);
+        self
+      }
+    }
+  });
+  let getter = field.skip_get.not().then(|| {
+    let fn_name = format_ident!("get_{}", name);
+    let mut_fn_name = format_ident!("get_mut_{}", name);
+    quote_spanned! {span=>
+      #vis fn #fn_name(&self) -> #field_ty_ref {
+        self.#name.as_ref()
+      }
+      #vis fn #mut_fn_name(&mut self) -> #field_ty_mut {
+        self.#name.as_mut()
+      }
+    }
+  });
+
+  let build = if is_option
+  {
+    quote_spanned! {span=>
+      #name: self.#name.take(),
+    }
+  }
+  else
+  {
+    quote_spanned! {span=>
+      #name: self.#name.take()?,
+    }
+  };
+
+  StructFieldTokens { errors, new, init, setter, getter, build }
 }
 
 fn do_expend(input: &DeriveInput) -> TokenStream
@@ -272,106 +411,13 @@ fn do_expend(input: &DeriveInput) -> TokenStream
       let vis: Visibility = parse_quote!(pub);
       let builder_ident = format_ident!("{}Builder", ty);
 
-      let (new_fields, init_fields, fields_setter_getter, build_fields): (
-        TokenStream,
-        TokenStream,
-        TokenStream,
-        TokenStream,
-      ) = parsed
-        .fields
-        .iter()
-        .filter(|field| !field.skip)
-        .map(|field| {
-          let mut unknown_ident_error = None;
-          let unknown_ident = field
-            .name_or_index
-            .to_ident(Ident::new("unknown", Span::call_site()));
-          let span = field.span;
-          let name = field.name.as_ref().unwrap_or_else(|| {
-            unknown_ident_error = Some(Error::new(
-              span.clone(),
-              "not set ident, please use #[builder(ident = \"new_ident\")]",
-            ));
-            &unknown_ident
-          });
-          let old_field_ty = &field.ty;
-          let field_ty_ref: Type;
-          let field_ty_mut: Type;
-          let option_inner_ty: Type;
-          let inner_ty: Type;
-          let param_ty: &Type;
-          let is_option: bool;
-          match get_option_inner_type(&old_field_ty)
-          {
-            Some(old_field_inner_ty) =>
-            {
-              is_option = true;
-              inner_ty = old_field_inner_ty;
-            }
-            None =>
-            {
-              is_option = false;
-              inner_ty = old_field_ty.clone();
-            }
-          }
-          field_ty_ref = parse_quote!(::core::option::Option<&#inner_ty>);
-          field_ty_mut = parse_quote!(::core::option::Option<&mut #inner_ty>);
-          option_inner_ty = parse_quote!(::core::option::Option<#inner_ty>);
-          param_ty = &inner_ty;
-
-          let setter = field.skip_set.not().then(|| {
-            let fn_name = name;
-            quote_spanned! {span=>
-              #vis fn #fn_name(&mut self, #name: #param_ty) -> &mut Self {
-                self.#name = Some(#name);
-                self
-              }
-            }
-          });
-          let getter = field.skip_get.not().then(|| {
-            let fn_name = format_ident!("get_{}", name);
-            let mut_fn_name = format_ident!("get_mut_{}", name);
-            quote_spanned! {span=>
-              #vis fn #fn_name(&self) -> #field_ty_ref {
-                self.#name.as_ref()
-              }
-              #vis fn #mut_fn_name(&mut self) -> #field_ty_mut {
-                self.#name.as_mut()
-              }
-            }
-          });
-
-          let build_field = if is_option
-          {
-            quote_spanned! {span=>
-              #name: self.#name.take(),
-            }
-          }
-          else
-          {
-            quote_spanned! {span=>
-              #name: self.#name.take()?,
-            }
-          };
-
-          let unknown_ident_error =
-            unknown_ident_error.map(Error::into_compile_error);
-          (
-            quote_spanned! {span=>
-              #name: #option_inner_ty,
-            },
-            quote_spanned! {span=>
-              #name: ::core::option::None,
-            },
-            quote_spanned! {span=>
-              #unknown_ident_error
-              #setter
-              #getter
-            },
-            build_field,
-          )
-        })
-        .collect();
+      let StructFieldTokens { mut errors, new, init, setter, getter, build } =
+        parsed
+          .fields
+          .iter()
+          .filter(|field| !field.skip)
+          .map(|field| generate_field_tokens(&vis, field))
+          .collect();
 
       let (derive_meta, builder_fn): (Meta, ItemFn) = if parsed.no_default
       {
@@ -379,7 +425,7 @@ fn do_expend(input: &DeriveInput) -> TokenStream
           parse_quote!(derive(Clone, Debug)),
           parse_quote!(
             #vis fn builder() -> #builder_ident {
-              #builder_ident { #init_fields }
+              #builder_ident { #init }
             }
           ),
         )
@@ -396,7 +442,8 @@ fn do_expend(input: &DeriveInput) -> TokenStream
         )
       };
 
-      let errors = parsed.errors.into_iter().map(Error::into_compile_error);
+      errors.extend(parsed.errors);
+      let errors = errors.into_iter().map(Error::into_compile_error);
       let span = input.span();
       quote_spanned! {span=>
         #(#errors)*
@@ -405,12 +452,13 @@ fn do_expend(input: &DeriveInput) -> TokenStream
         }
         #[#derive_meta]
         #vis struct #builder_ident {
-          #new_fields
+          #new
         }
         impl #builder_ident {
-          #fields_setter_getter
+          #setter
+          #getter
           #vis fn build(&mut self) -> ::core::option::Option<#ty> {
-            Some(#ty { #build_fields })
+            Some(#ty { #build })
           }
         }
       }

@@ -2,7 +2,7 @@
 name = "derive_builder"
 version = "0.0.0"
 autotests = false
-edition = "2021"
+edition = "2024"
 publish = false
 
 [lib]
@@ -31,6 +31,14 @@ path = "tests/04-call-build.rs"
 [[test]]
 name = "05"
 path = "tests/05-method-chaining.rs"
+
+[[test]]
+name = "06"
+path = "tests/06-optional-field.rs"
+
+[[test]]
+name = "07"
+path = "tests/07-repeated-field.rs"
 
 [dev-dependencies]
 trybuild = { version = "1.0.108", features = ["diff"] }
