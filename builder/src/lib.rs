@@ -8,10 +8,10 @@ use syn::{
   DataStruct,
   DeriveInput,
   Error,
-  ExprAssign,
   GenericArgument,
   Index,
   ItemFn,
+  LitStr,
   Meta,
   PathArguments,
   Type,
@@ -39,7 +39,7 @@ struct StructFieldParsed
   skip_set:      bool,
   skip_get:      bool,
   skip:          bool,
-  each:          Option<Ident>,
+  each:          Option<LitStr>,
 }
 #[derive(Clone)]
 enum StructFieldNameParsed
@@ -144,36 +144,19 @@ pub fn derive(input: proc_macro::TokenStream) -> proc_macro::TokenStream
   do_expend(&input).into()
 }
 
-fn get_inner_type(ty: &Type) -> Option<Type>
-{
-  get_inner_type_if(ty, |_| true)
-}
-
-fn get_inner_type_if(ty: &Type, f: impl FnOnce(&Ident) -> bool)
--> Option<Type>
+fn split_type_to_outer_inner(ty: &Type) -> Option<(&Ident, &Type)>
 {
   if let Type::Path(path) = ty
     && let Some(last) = path.path.segments.last()
-    && f(&last.ident)
     && let PathArguments::AngleBracketed(args) = &last.arguments
     && let GenericArgument::Type(inner_ty) = args.args.first()?
   {
-    Some(inner_ty.clone())
+    Some((&last.ident, inner_ty))
   }
   else
   {
     None
   }
-}
-
-fn get_option_inner_type(ty: &Type) -> Option<Type>
-{
-  get_inner_type_if(ty, |ident| ident == "Option")
-}
-
-fn get_vec_inner_type(ty: &Type) -> Option<Type>
-{
-  get_inner_type_if(ty, |ident| ident == "Vec")
 }
 
 fn parse_struct(
@@ -227,77 +210,88 @@ fn parse_struct(
       let mut skip_set = false;
       let mut skip_get = false;
       let mut skip = false;
-      let mut each = None;
+      let mut each: Option<Result<_, ()>> = None;
 
-      for attr in
-        field.attrs.iter().filter(|attr| attr.meta.path().is_ident("builder"))
-      {
-        match attr.parse_args::<Ident>()
-        {
-          Ok(arg) =>
-          {
-            let arg = arg.to_string();
-            match arg.as_str()
+      let field_attr_errors: Vec<_> = field
+        .attrs
+        .iter()
+        .filter(|attr| attr.meta.path().is_ident("builder"))
+        .map(|attr| {
+          attr.parse_nested_meta(|meta| {
+            if let Some(ident) = meta.path.get_ident()
             {
-              "skip" =>
+              let arg = ident.to_string();
+              match arg.as_str()
               {
-                if skip
+                "skip" =>
                 {
-                  errors.push(Error::new_spanned(arg, "already set 'skip'"));
+                  skip.not().ok_or_else(|| {
+                    Error::new_spanned(arg, "already set 'skip'")
+                  })?;
+                  skip = true;
+                  Ok(())
                 }
-                skip = true;
-              }
-              "skip_set" =>
-              {
-                if skip_set
+                "skip_set" =>
                 {
-                  errors
-                    .push(Error::new_spanned(arg, "already set 'skip_set'"));
+                  skip_set.not().ok_or_else(|| {
+                    Error::new_spanned(arg, "already set 'skip_set'")
+                  })?;
+                  skip_set = true;
+                  Ok(())
                 }
-                skip_set = true;
-              }
-              "skip_get" =>
-              {
-                if skip_get
+                "skip_get" =>
                 {
-                  errors
-                    .push(Error::new_spanned(arg, "already set 'skip_get'"));
+                  skip_get.not().ok_or_else(|| {
+                    Error::new_spanned(arg, "already set 'skip_get'")
+                  })?;
+                  skip_get = true;
+                  Ok(())
                 }
-                skip_get = true;
-              }
-              other =>
-              {
-                errors.push(Error::new_spanned(
-                  arg,
+                "each" =>
+                {
+                  let each_ident = meta.value()?.parse::<LitStr>()?;
+                  if let Some(each) = &each
+                  {
+                    Err(Error::new_spanned(
+                      &attr,
+                      each.as_ref().map(LitStr::value).map_or_else(
+                        |()| "<error>".to_string(),
+                        |ident| format!("already set 'each = {ident}'",),
+                      ),
+                    ))
+                  }
+                  else
+                  {
+                    each = Some(Ok(each_ident));
+                    Ok(())
+                  }
+                }
+                other => Err(Error::new_spanned(
+                  &arg,
                   format!("unknown attribute '{other}'"),
-                ));
+                )),
               }
             }
-          }
-          Err(err) =>
-          {
-            errors.push(err);
-          }
-        };
-        match attr.parse_args::<ExprAssign>()
-        {
-          Ok(ExprAssign { left, right, .. }) =>
-          {
-            if let Some(each) = each
+            else
             {
-              errors.push(Error::new_spanned(
-                attr,
-                format!("already set 'each = '"),
-              ));
+              Err(Error::new_spanned(
+                &attr,
+                format!("except identifier, but {}", attr.to_token_stream()),
+              ))
             }
-            each = Some(());
-          }
-          Err(err) =>
+          })
+        })
+        .fold(Vec::new(), |acc, result| match (acc, result)
+        {
+          (errs, Ok(())) => errs,
+          (mut errs, Err(e)) =>
           {
-            errors.push(err);
+            errs.push(e);
+            errs
           }
-        };
-      }
+        });
+      errors.extend(field_attr_errors);
+      let each = each.and_then(Result::ok);
       StructFieldParsed {
         name,
         name_or_index,
@@ -331,45 +325,70 @@ fn generate_field_tokens(
   let old_field_ty = &field.ty;
   let field_ty_ref: Type;
   let field_ty_mut: Type;
-  let option_inner_ty: Type;
-  let inner_ty: Type;
-  let param_ty: &Type;
+  let new_field_ty: Type;
+  let in_vec_ty: Type;
+  let param_ty: Type;
   let is_option: bool;
-  match get_option_inner_type(&old_field_ty)
+  match split_type_to_outer_inner(&old_field_ty)
   {
-    Some(old_field_inner_ty) =>
+    Some((outer, old_field_inner_ty)) if outer == "Option" =>
     {
       is_option = true;
-      inner_ty = old_field_inner_ty;
+      field_ty_ref = parse_quote!(::core::option::Option<&#old_field_inner_ty>);
+      field_ty_mut =
+        parse_quote!(::core::option::Option<&mut #old_field_inner_ty>);
+      new_field_ty = parse_quote!(::core::option::Option<#old_field_inner_ty>);
+      param_ty = old_field_inner_ty.clone();
+      in_vec_ty = parse_quote!(!);
     }
-    None =>
+    Some((outer, old_field_inner_ty)) if outer == "Vec" =>
     {
       is_option = false;
-      inner_ty = old_field_ty.clone();
+      field_ty_ref = parse_quote!(::core::option::Option<&#old_field_ty>);
+      field_ty_mut = parse_quote!(::core::option::Option<&mut #old_field_ty>);
+      new_field_ty = parse_quote!(::std::vec::Vec<#old_field_ty>);
+      param_ty = old_field_ty.clone();
+      in_vec_ty = old_field_inner_ty.clone();
+    }
+    _ =>
+    {
+      is_option = false;
+      field_ty_ref = parse_quote!(::core::option::Option<&#old_field_ty>);
+      field_ty_mut = parse_quote!(::core::option::Option<&mut #old_field_ty>);
+      new_field_ty = parse_quote!(::core::option::Option<#old_field_ty>);
+      param_ty = old_field_ty.clone();
+      in_vec_ty = parse_quote!(!);
     }
   }
-  field_ty_ref = parse_quote!(::core::option::Option<&#inner_ty>);
-  field_ty_mut = parse_quote!(::core::option::Option<&mut #inner_ty>);
-  option_inner_ty = parse_quote!(::core::option::Option<#inner_ty>);
-  param_ty = &inner_ty;
 
   let new = quote_spanned! {span=>
-    #name: #option_inner_ty,
+    #name: #new_field_ty,
   };
 
   let init = quote_spanned! {span=>
     #name: ::core::option::None,
   };
 
-  let setter = field.skip_set.not().then(|| {
-    let fn_name = name;
-    quote_spanned! {span=>
-      #vis fn #fn_name(&mut self, #name: #param_ty) -> &mut Self {
-        self.#name = Some(#name);
-        self
+  let setter = field.skip_set.not().then_some(field.each.as_ref().map_or_else(
+    || {
+      let fn_name = name;
+      quote_spanned! {span=>
+        #vis fn #fn_name(&mut self, #name: #param_ty) -> &mut Self {
+          self.#name = Some(#name);
+          self
+        }
       }
-    }
-  });
+    },
+    |each| {
+      let fn_name = format_ident!("{}", each.value());
+      quote_spanned! {span=>
+        #vis fn #fn_name(&mut self, one: #in_vec_ty) -> &mut Self {
+          self.#name.extend_one(one);
+          self
+        }
+      }
+    },
+  ));
   let getter = field.skip_get.not().then(|| {
     let fn_name = format_ident!("get_{}", name);
     let mut_fn_name = format_ident!("get_mut_{}", name);
