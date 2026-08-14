@@ -8,6 +8,7 @@ use syn::{
   DataStruct,
   DeriveInput,
   Error,
+  Expr,
   GenericArgument,
   Index,
   ItemFn,
@@ -19,6 +20,7 @@ use syn::{
   ext::IdentExt,
   parse_macro_input,
   parse_quote,
+  parse_quote_spanned,
   spanned::Spanned,
 };
 
@@ -35,11 +37,26 @@ struct StructFieldParsed
   name:          Option<Ident>,
   name_or_index: StructFieldNameParsed,
   span:          Span,
-  ty:            Type,
+  ty:            StructFieldTypeParsed,
   skip_set:      bool,
   skip_get:      bool,
   skip:          bool,
-  each:          Option<LitStr>,
+}
+#[derive(Clone)]
+enum StructFieldTypeParsed
+{
+  Normal
+  {
+    ty: Type
+  },
+  Option
+  {
+    inner_ty: Type
+  },
+  Vec
+  {
+    inner_ty: Type, each: Option<LitStr>
+  },
 }
 #[derive(Clone)]
 enum StructFieldNameParsed
@@ -136,6 +153,255 @@ impl FromIterator<StructFieldTokens> for StructFieldTokens
   }
 }
 
+impl StructFieldParsed
+{
+  pub fn fn_set(&self, vis: &Visibility) -> TokenStream
+  {
+    let field_index = &self.name_or_index;
+    let field_ident = self.name_or_index.to_ident("unknown");
+    let param_name = self.name.as_ref().unwrap_or(&field_ident);
+    let param_ty = self.ty.ty_fn_set();
+    match &self.ty
+    {
+      StructFieldTypeParsed::Normal { .. } =>
+      {
+        let fn_name = param_name;
+        quote_spanned! {self.span=>
+          #vis fn #fn_name(&mut self, #param_name: #param_ty) -> &mut Self {
+            self.#field_index = Some(#param_name);
+            self
+          }
+        }
+      }
+      StructFieldTypeParsed::Option { .. } =>
+      {
+        let fn_name = param_name;
+        quote_spanned! {self.span=>
+          #vis fn #fn_name(&mut self, #param_name: #param_ty) -> &mut Self {
+            self.#field_index = Some(#param_name);
+            self
+          }
+        }
+      }
+      StructFieldTypeParsed::Vec { each: Some(each), .. } =>
+      {
+        let fn_name = Ident::new(&each.value(), self.span);
+        quote_spanned! {self.span=>
+          #vis fn #fn_name(&mut self, #each: #param_ty) -> &mut Self {
+            self.#field_index.extend_one(#each);
+            self
+          }
+        }
+      }
+      StructFieldTypeParsed::Vec { each: _, .. } =>
+      {
+        let fn_name = param_name;
+        quote_spanned! {self.span=>
+          #vis fn #fn_name(&mut self, #param_name: #param_ty) -> &mut Self {
+            self.#field_index.extend(#param_name);
+            self
+          }
+        }
+      }
+    }
+  }
+
+  pub fn fn_get(&self, vis: &Visibility) -> TokenStream
+  {
+    let field_index = &self.name_or_index;
+    let field_ident = self.name_or_index.to_ident("unknown");
+    let param_name = self.name.as_ref().unwrap_or(&field_ident);
+    let ret_ty = self.ty.ty_ref_get();
+    match &self.ty
+    {
+      StructFieldTypeParsed::Normal { .. } =>
+      {
+        let fn_name = Ident::new(&format!("get_{param_name}"), self.span);
+        quote_spanned! {self.span=>
+          #vis fn #fn_name(&mut self) -> #ret_ty {
+            self.#field_index.as_ref()
+          }
+        }
+      }
+      StructFieldTypeParsed::Option { .. } =>
+      {
+        let fn_name = Ident::new(&format!("get_{param_name}"), self.span);
+        quote_spanned! {self.span=>
+          #vis fn #fn_name(&mut self) -> #ret_ty {
+            self.#field_index.as_ref()
+          }
+        }
+      }
+      StructFieldTypeParsed::Vec { each: Some(each), .. } =>
+      {
+        let fn_name = Ident::new(&format!("get_{param_name}"), self.span);
+        quote_spanned! {self.span=>
+          #vis fn #fn_name(&mut self) -> #ret_ty {
+            &self.#field_index
+          }
+        }
+      }
+      StructFieldTypeParsed::Vec { each: _, .. } =>
+      {
+        let fn_name = Ident::new(&format!("get_{param_name}"), self.span);
+        quote_spanned! {self.span=>
+          #vis fn #fn_name(&mut self) -> #ret_ty {
+            &self.#field_index
+          }
+        }
+      }
+    }
+  }
+
+  pub fn fn_name_get_mut(&self) -> Ident
+  {
+    let unknown_ident =
+      self.name_or_index.to_ident(Ident::new("unknown", Span::call_site()));
+    let name = self.name.as_ref().unwrap_or(&unknown_ident);
+    match &self.ty
+    {
+      StructFieldTypeParsed::Normal { .. } =>
+      {
+        format_ident!("get_mut_{name}")
+      }
+      StructFieldTypeParsed::Option { .. } =>
+      {
+        format_ident!("get_mut_{name}")
+      }
+      StructFieldTypeParsed::Vec { each: Some(each), .. } =>
+      {
+        format_ident!("get_mut_{}", each.value())
+      }
+      StructFieldTypeParsed::Vec { each: _, .. } =>
+      {
+        format_ident!("get_mut_{name}")
+      }
+    }
+  }
+}
+
+impl StructFieldTypeParsed
+{
+  pub fn ty_ref_get(&self) -> Type
+  {
+    match self
+    {
+      StructFieldTypeParsed::Normal { ty } =>
+      {
+        parse_quote_spanned! {
+          ty.span() => ::core::option::Option<&#ty>
+        }
+      }
+      StructFieldTypeParsed::Option { inner_ty } =>
+      {
+        parse_quote_spanned! {
+          inner_ty.span() => ::core::option::Option<&#inner_ty>
+        }
+      }
+      StructFieldTypeParsed::Vec { inner_ty, .. } =>
+      {
+        parse_quote_spanned! {
+          inner_ty.span() => &[#inner_ty]
+        }
+      }
+    }
+  }
+
+  pub fn ty_mut_get(&self) -> Type
+  {
+    match self
+    {
+      StructFieldTypeParsed::Normal { ty } =>
+      {
+        parse_quote_spanned! {
+          ty.span() => ::core::option::Option<&mut #ty>
+        }
+      }
+      StructFieldTypeParsed::Option { inner_ty } =>
+      {
+        parse_quote_spanned! {
+          inner_ty.span() => ::core::option::Option<&mut #inner_ty>
+        }
+      }
+      StructFieldTypeParsed::Vec { inner_ty, .. } =>
+      {
+        parse_quote_spanned! {
+          inner_ty.span() => &mut [#inner_ty]
+        }
+      }
+    }
+  }
+
+  pub fn ty_to_builder(&self) -> Type
+  {
+    match self
+    {
+      StructFieldTypeParsed::Normal { ty } =>
+      {
+        parse_quote_spanned! {
+          ty.span() => ::core::option::Option<#ty>
+        }
+      }
+      StructFieldTypeParsed::Option { inner_ty } =>
+      {
+        parse_quote_spanned! {
+          inner_ty.span() => ::core::option::Option<#inner_ty>
+        }
+      }
+      StructFieldTypeParsed::Vec { inner_ty, .. } =>
+      {
+        parse_quote_spanned! {
+          inner_ty.span() => ::std::vec::Vec<#inner_ty>
+        }
+      }
+    }
+  }
+
+  pub fn ty_fn_set(&self) -> Type
+  {
+    match self
+    {
+      StructFieldTypeParsed::Normal { ty } => ty.clone(),
+      StructFieldTypeParsed::Option { inner_ty } => inner_ty.clone(),
+      StructFieldTypeParsed::Vec { inner_ty, each: Some(_each) } =>
+      {
+        inner_ty.clone()
+      }
+      StructFieldTypeParsed::Vec { inner_ty, each: _ } =>
+      {
+        parse_quote_spanned! {
+          inner_ty.span() => ::std::vec::Vec<#inner_ty>
+        }
+      }
+    }
+  }
+
+  pub fn tokens_take(&self, expr: &Expr) -> TokenStream
+  {
+    match self
+    {
+      StructFieldTypeParsed::Normal { ty } =>
+      {
+        quote_spanned! {
+          ty.span() => ::core::option::Option::<#ty>::take(#expr)
+        }
+      }
+      StructFieldTypeParsed::Option { inner_ty } =>
+      {
+        quote_spanned! {
+          inner_ty.span() => ::core::option::Option<#inner_ty>::take(#expr)
+        }
+      }
+      StructFieldTypeParsed::Vec { inner_ty, .. } =>
+      {
+        quote_spanned! {
+          inner_ty.span() => &#expr
+        }
+      }
+    }
+  }
+}
+
 #[proc_macro_derive(Builder, attributes(builder))]
 pub fn derive(input: proc_macro::TokenStream) -> proc_macro::TokenStream
 {
@@ -206,7 +472,21 @@ fn parse_struct(
         .map(StructFieldNameParsed::Named)
         .unwrap_or(StructFieldNameParsed::Unnamed(i));
       let span = field.span();
-      let ty = field.ty.clone();
+      let ty = match split_type_to_outer_inner(&field.ty)
+      {
+        Some((outer_ty, inner_ty)) if outer_ty == "Option" =>
+        {
+          StructFieldTypeParsed::Option { inner_ty: inner_ty.clone() }
+        }
+        Some((outer_ty, inner_ty)) if outer_ty == "Vec" =>
+        {
+          StructFieldTypeParsed::Vec {
+            inner_ty: inner_ty.clone(),
+            each:     None,
+          }
+        }
+        _ => StructFieldTypeParsed::Normal { ty: field.ty.clone() },
+      };
       let mut skip_set = false;
       let mut skip_get = false;
       let mut skip = false;
@@ -291,7 +571,6 @@ fn parse_struct(
           }
         });
       errors.extend(field_attr_errors);
-      let each = each.and_then(Result::ok);
       StructFieldParsed {
         name,
         name_or_index,
@@ -300,7 +579,6 @@ fn parse_struct(
         skip_set,
         skip_get,
         skip,
-        each,
       }
     })
     .collect();
@@ -322,97 +600,26 @@ fn generate_field_tokens(
     ));
     &unknown_ident
   });
-  let old_field_ty = &field.ty;
-  let field_ty_ref: Type;
-  let field_ty_mut: Type;
-  let new_field_ty: Type;
-  let in_vec_ty: Type;
-  let param_ty: Type;
-  let is_option: bool;
-  match split_type_to_outer_inner(&old_field_ty)
-  {
-    Some((outer, old_field_inner_ty)) if outer == "Option" =>
-    {
-      is_option = true;
-      field_ty_ref = parse_quote!(::core::option::Option<&#old_field_inner_ty>);
-      field_ty_mut =
-        parse_quote!(::core::option::Option<&mut #old_field_inner_ty>);
-      new_field_ty = parse_quote!(::core::option::Option<#old_field_inner_ty>);
-      param_ty = old_field_inner_ty.clone();
-      in_vec_ty = parse_quote!(!);
-    }
-    Some((outer, old_field_inner_ty)) if outer == "Vec" =>
-    {
-      is_option = false;
-      field_ty_ref = parse_quote!(::core::option::Option<&#old_field_ty>);
-      field_ty_mut = parse_quote!(::core::option::Option<&mut #old_field_ty>);
-      new_field_ty = parse_quote!(::std::vec::Vec<#old_field_ty>);
-      param_ty = old_field_ty.clone();
-      in_vec_ty = old_field_inner_ty.clone();
-    }
-    _ =>
-    {
-      is_option = false;
-      field_ty_ref = parse_quote!(::core::option::Option<&#old_field_ty>);
-      field_ty_mut = parse_quote!(::core::option::Option<&mut #old_field_ty>);
-      new_field_ty = parse_quote!(::core::option::Option<#old_field_ty>);
-      param_ty = old_field_ty.clone();
-      in_vec_ty = parse_quote!(!);
-    }
-  }
+  let field_ty = &field.ty;
+  let builder_field_ty: Type = field_ty.ty_to_builder();
 
   let new = quote_spanned! {span=>
-    #name: #new_field_ty,
+    #name: #builder_field_ty,
   };
 
   let init = quote_spanned! {span=>
     #name: ::core::option::None,
   };
 
-  let setter = field.skip_set.not().then_some(field.each.as_ref().map_or_else(
-    || {
-      let fn_name = name;
-      quote_spanned! {span=>
-        #vis fn #fn_name(&mut self, #name: #param_ty) -> &mut Self {
-          self.#name = Some(#name);
-          self
-        }
-      }
-    },
-    |each| {
-      let fn_name = format_ident!("{}", each.value());
-      quote_spanned! {span=>
-        #vis fn #fn_name(&mut self, one: #in_vec_ty) -> &mut Self {
-          self.#name.extend_one(one);
-          self
-        }
-      }
-    },
-  ));
-  let getter = field.skip_get.not().then(|| {
-    let fn_name = format_ident!("get_{}", name);
-    let mut_fn_name = format_ident!("get_mut_{}", name);
-    quote_spanned! {span=>
-      #vis fn #fn_name(&self) -> #field_ty_ref {
-        self.#name.as_ref()
-      }
-      #vis fn #mut_fn_name(&mut self) -> #field_ty_mut {
-        self.#name.as_mut()
-      }
-    }
+  let setter = field.skip_set.not().then(|| field.fn_set(&vis));
+  let getter = field.skip_get.not().then(|| field.fn_get(&vis));
+
+  let take = field_ty.tokens_take(&parse_quote_spanned! {span=>
+    self.#name
   });
 
-  let build = if is_option
-  {
-    quote_spanned! {span=>
-      #name: self.#name.take(),
-    }
-  }
-  else
-  {
-    quote_spanned! {span=>
-      #name: self.#name.take()?,
-    }
+  let build = quote_spanned! {span=>
+    #name: #take,
   };
 
   StructFieldTokens { errors, new, init, setter, getter, build }
