@@ -17,7 +17,6 @@ use syn::{
   PathArguments,
   Type,
   Visibility,
-  ext::IdentExt,
   parse_macro_input,
   parse_quote,
   parse_quote_spanned,
@@ -394,6 +393,24 @@ fn split_type_to_outer_inner(ty: &Type) -> Option<(&Ident, &Type)>
   }
 }
 
+trait RefMap<T, E> {
+  fn ref_map<U, F>(self, op: F) -> Result<U, E>
+  where
+    F: FnOnce(&T) -> U;
+}
+
+impl<T, E> RefMap<T, E> for Result<T, E> {
+  fn ref_map<U, F>(self, op: F) -> Result<U, E>
+  where
+    F: FnOnce(&T) -> U,
+  {
+    match self {
+      Ok(ok) => Ok(op(&ok)),
+      Err(err) => Err(err),
+    }
+  }
+}
+
 fn parse_struct(
   struct_attrs: &Vec<Attribute>, data_struct: &DataStruct,
 ) -> StructParsed
@@ -405,27 +422,26 @@ fn parse_struct(
   let struct_attr_errors: Vec<_> = struct_attrs
     .iter()
     .filter(|attr| attr.meta.path().is_ident("builder"))
-    .map(|attr| {
-      let ident = attr.parse_args::<Ident>()?;
-      if ident.unraw() == "no_default"
-      {
-        if no_default
-        {
-          return Err(Error::new_spanned(ident, "already set 'no_default'"));
-        }
-        no_default = true;
-      }
-      Ok(())
-    })
-    .fold(Vec::new(), |acc, result| match (acc, result)
+    .map(Attribute::parse_args::<Ident>).filter_map(|ident| {
+    if let Ok(ident) = &ident && ident == "no_default"
     {
-      (errs, Ok(())) => errs,
-      (mut errs, Err(e)) =>
-        {
-          errs.push(e);
-          errs
-        }
-    });
+      if no_default
+      {
+        return Some(Error::new_spanned(ident, "already set 'no_default'"));
+      }
+      no_default = true;
+    }
+    ident.err()
+  }).collect();
+  // .fold(Vec::new(), |acc, result| match (acc, result)
+  // {
+  //   (errs, Ok(())) => errs,
+  //   (mut errs, Err(e)) =>
+  //     {
+  //       errs.push(e);
+  //       errs
+  //     }
+  // });
   errors.extend(struct_attr_errors);
 
   // parse fields
